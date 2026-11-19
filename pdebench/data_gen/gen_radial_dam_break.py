@@ -43,12 +43,14 @@ def simulator(base_config, i):
     log.info("Starting seed %d", i)
 
     rng = np.random.default_rng(config.sim.seed)
-    # config.sim.inner_height = np.random.uniform(1.5, 2.5)
+    # 方向 D：加入第二個參數 inner_height（壩內初始水位），讓資料變成 2 參數家族
+    config.sim.inner_height = rng.uniform(1.5, 2.5)
     config.sim.dam_radius = rng.uniform(0.3, 0.7)
 
     scenario = RadialDamBreak2D(
         grav=config.sim.gravity,
         dam_radius=config.sim.dam_radius,
+        inner_height=config.sim.inner_height,
         xdim=config.sim.xdim,
         ydim=config.sim.ydim,
     )

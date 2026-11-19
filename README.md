@@ -1,594 +1,124 @@
-# PDEBench
+# COMP4471 Project 文件
 
-The code repository for the NeurIPS 2022 paper
-[PDEBench: An Extensive Benchmark for Scientific Machine Learning](https://arxiv.org/abs/2210.07182)
+**Deep Learning for Super-Resolution of Scientific Simulation Data**
 
-:tada:
-[**SimTech Best Paper Award 2023**](https://www.simtech.uni-stuttgart.de/press/SimTech-Best-Paper-Award-2023-Benchmark-for-ML-for-scientific-simulations)
-:confetti_ball:
+- 團隊：LI Muzi (21435533)、YEUNG Ho Yin (21042453)
+- 課程：COMP4471
 
-PDEBench provides a diverse and comprehensive set of benchmarks for scientific
-machine learning, including challenging and realistic physical problems. This
-repository consists of the code used to generate the datasets, to upload and
-download the datasets from the data repository, as well as to train and evaluate
-different machine learning models as baselines. PDEBench features a much wider
-range of PDEs than existing benchmarks and includes realistic and difficult
-problems (both forward and inverse), larger ready-to-use datasets comprising
-various initial and boundary conditions, and PDE parameters. Moreover, PDEBench
-was created to make the source code extensible and we invite active
-participation from the SciML community to improve and extend the benchmark.
+## 交接總覽
 
-![Visualizations of some PDE problems covered by the benchmark.](https://github.com/pdebench/PDEBench/blob/main/pdebench_examples.PNG)
+👉 **先看 [`../PDEBench/PROJECT.md`](../PDEBench/PROJECT.md)**：一頁摘要（快速開始、關鍵結果、資料交接）。
 
-Created and maintained by Makoto Takamoto
-`<makoto.takamoto@neclab.eu, takamtmk@gmail.com>`, Timothy Praditia
-`<timothy.praditia@iws.uni-stuttgart.de>`, Raphael Leiteritz, Dan MacKinlay,
-Francesco Alesiani, Dirk Pflüger, and Mathias Niepert.
+## 文件索引
 
----
-## Compatibility with Newer Python, JAX, PyTorch, and CUDA Versions
+| 文件 | 內容 |
+|---|---|
+| [01 - Project 目標](./01-project-overview.md) | 問題定義、目標、資料、方法總覽 |
+| [02 - 技術解釋](./02-technical-explanation.md) | 資料、流程、U-Net 架構、損失、優化器、指標 |
+| [03 - 進一步方向](./03-future-directions.md) | 方向 A/B/C/D/E 與優先級 |
+| [04 - 目前進度](./04-progress.md) | 已完成工作、模型對照 + 噪聲消融結果、結論 |
+| [Colab 資料生成](./colab_regenerate.md) | 在 Colab 重新生成 1000 樣本、3 通道資料（重置版） |
+| [Colab 訓練](./colab_training.md) | 付費 GPU 上一次跑完 4 個模型對照 |
+| [Colab 消融](./colab_ablation.md) | 噪聲 / 參數外推 / 時間外推 / 混合（4 實驗 × 4 模型） |
 
-While this project officially targets older versions: 
-- Python 3.9  
-- JAX 0.4.11  
-- PyTorch 1.13.0  
-- CUDA 11.7  
+## 關鍵檔案位置
 
-we have verified that most components remain compatible with newer releases.:
-- Python 3.12  
-- JAX 0.9.2  
-- PyTorch 2.11.0  
-- CUDA 13.0  
+| 檔案 | 路徑 |
+|---|---|
+| 主訓練/評估腳本 | `../PDEBench/pdebench/train_unet_v2.py` |
+| 本地補算 baseline | `../PDEBench/pdebench/run_eval.py` |
+| 一次跑 4 模型 | `../PDEBench/pdebench/run_experiments.py` |
+| 交接總覽 | `../PDEBench/PROJECT.md` |
+| 資料（3 通道、1000 樣本） | `../PDEBench/pdebench/data/2D_rdb_NA_NA_.h5` |
+| 消融結果 | `../PDEBench/pdebench/ab_*/`、`outputs*/` |
+| Proposal | `../COMP4471_Project_Proposal.pdf` |
 
-In particular, the core codebase, forward training in `pdebench/model`, and data generation in `data_gen_NLE` work with these newer versions.
-Compatibility for the remaining components is still under investigation.
-_Last updated: 2026-03-30_
+## 參數說明（`train_unet_v2.py`）
 
-## Data Path Issue in Forward Training (`model/fno/utils.py` and `model/unet/utils.py`)
+### 資料
 
-We identified an issue with data paths during forward training in `model/fno/utils.py` and `model/unet/utils.py`. This problem is caused by Hydra modifying the `data_path` at runtime.
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--data_path` | `data/2D_rdb_NA_NA.h5` | HDF5 資料路徑 |
+| `--t_start` | 0 | 起始時間步 |
+| `--t_end` | 100 | 結束時間步（含）。21 幀資料用 `--t_end 20` |
+| `--t_step` | 1 | 時間步間隔（>1 降低相鄰幀相關性與成本） |
+| `--noise_std` | 0.0 | 加到 LR 的量測雜訊標準差 σ（0=不加） |
+| `--data_range` | None | 固定 PSNR 的 R（跨實驗可比；預設從訓練集算） |
 
-To resolve this issue, please use the commented lines:
-- Lines 185–188 in `model/fno/utils.py`  
-- Lines 185–187 in `model/unet/utils.py`  
+### 下採樣
 
-(Note that the above modification (use of "to_absolute_path" in hydra) is allowed Hydra version >= 0.11.0.)
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--factor` | 4 | 下採樣倍率（2 / 4 / 8） |
+| `--downsample` | `block` | `block`=反鋸齒平均；`pointwise`=隔行取樣（無反鋸齒，凸顯深度學習） |
 
-_Last updated: 2026-03-30_
+### 切分
 
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--train_frac` | 0.9 | 訓練用多少比例的唯一模擬 |
+| `--split_mode` | `random` | `random` / `extrapolate`（小半徑訓練、大半徑測試）/ `middle`（兩端訓練、中間測試） |
+| `--train_radius_max` | None | 半徑門檻 1：extrapolate=訓練 ≤ 此值；middle=低訓練帶上界 |
+| `--test_radius_min` | None | 半徑門檻 2：extrapolate=測試 ≥ 此值；middle=高訓練帶下界 |
+| `--temporal_split` | `none` | `none` / `head`（前幾幀訓練推後面）/ `tail`（後幾幀推前面） |
+| `--temporal_train_frac` | 0.25 | 時間切分時訓練用的幀比例（0.25 = 前 25% 幀訓練、後 75% 測試） |
+| `--val_frac` | 0.1 | 訓練集內再切出的驗證比例 |
 
-## Datasets and Pretrained Models
+### 模型
 
-We also provide datasets and pretrained machine learning models.
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--model` | `miniunet` | `miniunet`（2 層 U-Net）/ `unet2d`（4 層）/ `srcnn`（3 層 CNN） |
+| `--base` | 32 | 網路首層通道數（寬度） |
 
-PDEBench Datasets:
-https://darus.uni-stuttgart.de/dataset.xhtml?persistentId=doi:10.18419/darus-2986
+### 訓練
 
-PDEBench Pre-Trained Models:
-https://darus.uni-stuttgart.de/dataset.xhtml?persistentId=doi:10.18419/darus-2987
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--batch_size` | 32 | 批次大小（小模型可用 128，大模型用 64） |
+| `--epochs` | 100 | 最大 epoch |
+| `--lr` | 1e-3 | 學習率 |
+| `--weight_decay` | 1e-4 | Adam 權重衰減 |
+| `--loss` | `mse` | `mse`(L2) / `l1` / `charbonnier` |
+| `--grad_loss_weight` | 0.0 | 梯度 loss（Sobel）權重 λ（0=不用；0.5 可銳化衝擊波） |
+| `--seed` | 0 | 隨機種子（可復現） |
+| `--patience` | 15 | 早停：連續多少 epoch 無改善即停 |
+| `--lr_patience` | 5 | ReduceLROnPlateau 的 patience |
 
-DOIs
+### 執行
 
-[![DOI:10.18419/darus-2986](https://img.shields.io/badge/DOI-doi%3A10.18419%2Fdarus--2986-red)](https://doi.org/10.18419/darus-2986)
-[![DOI:10.18419/darus-2987](https://img.shields.io/badge/DOI-doi%3A10.18419%2Fdarus--2987-red)](https://doi.org/10.18419/darus-2987)
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--out_dir` | `outputs_unet_v2` | 輸出目錄（結果 + checkpoint） |
+| `--resume` | None | 從 checkpoint 繼續訓練 |
+| `--eval_only` | False | 不訓練，只讀 checkpoint 做評估（補算 baseline） |
+| `--ckpt` | None | 評估用 checkpoint（預設 `out_dir/model_best.pt`） |
 
-## Installation
-
-### Using pip
-
-Locally:
-
-```bash
-pip install --upgrade pip wheel
-pip install .
-```
-
-From PyPI:
-
-```bash
-pip install pdebench
-```
-
-To include dependencies for data generation:
-
-```bash
-pip install "pdebench[datagen310]"
-pip install ".[datagen310]" # locally
-```
-
-or
-
-```bash
-pip install "pdebench[datagen39]"
-pip install ".[datagen39]" # locally
-```
-
-### GPU Support
-
-For GPU support there are additional platform-specific instructions:
-
-For PyTorch, the latest version we support is v1.13.1
-[see previous-versions/#linux - CUDA 11.7](https://pytorch.org/get-started/previous-versions/#linux-and-windows-2).
-
-For JAX, which is approximately 6 times faster for simulations than PyTorch in
-our tests,
-[see jax#pip-installation-gpu-cuda-installed-via-pip](https://github.com/google/jax#pip-installation-gpu-cuda-installed-via-pip-easier)
-
-## Installation using conda:
-
-If you like you can also install dependencies using anaconda, we suggest to use
-[mambaforge](https://github.com/conda-forge/miniforge#mambaforge) as a
-distribution. Otherwise you may have to **enable the conda-forge** channel for
-the following commands.
-
-Starting from a fresh environment:
-
-```
-conda create -n myenv python=3.9
-conda activate myenv
-```
-
-Install dependencies for model training:
-
-```
-conda install deepxde hydra-core h5py -c conda-forge
-```
-
-According to your hardware availability, either install PyTorch with CUDA
-support:
-
-- [see previous-versions/#linux - CUDA 11.7](https://pytorch.org/get-started/previous-versions/#linux-and-windows-2).
-
-```
-conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 pytorch-cuda=11.7 -c pytorch -c nvidia
-```
-
-- [or CPU only binaries](https://pytorch.org/get-started/previous-versions/#linux-and-windows-2).
-
-```
-conda install pytorch==1.13.1 torchvision==0.14.1 torchaudio==0.13.1 cpuonly -c pytorch
-```
-
-Optional dependencies for data generation:
-
-```
-conda install clawpack jax jaxlib python-dotenv
-```
-
-## Configuring DeepXDE
-
-In our tests we used PyTorch as backend for DeepXDE. Please
-[follow the documentation](https://deepxde.readthedocs.io/en/latest/user/installation.html#working-with-different-backends)
-to enable this.
-
-## Data Generation
-
-The data generation codes are contained in [data_gen](./pdebench/data_gen):
-
-- `gen_diff_react.py` to generate the 2D diffusion-reaction data.
-- `gen_diff_sorp.py` to generate the 1D diffusion-sorption data.
-- `gen_radial_dam_break.py` to generate the 2D shallow-water data.
-- `gen_ns_incomp.py` to generate the 2D incompressible inhomogeneous
-  Navier-Stokes data.
-- `plot.py` to plot the generated data.
-- `uploader.py` to upload the generated data to the data repository.
-- `.env` is the environment data to store Dataverse URL and API token to upload
-  the generated data. Note that the filename should be strictly `.env` (i.e.
-  remove the `example` from the filename)
-- `configs` directory contains the yaml files storing the configuration for the
-  simulation. Arguments for the simulation are problem-specific and detailed
-  explanation can be found in the simulation scripts.
-- `src` directory contains the simulation scripts for different problems:
-  `sim_diff_react-py` for 2D diffusion-reaction, `sim_diff_sorp.py` for 1D
-  diffusion-sorption, and `swe` for the shallow-water equation.
-
-### Data Generation for 1D Advection/Burgers/Reaction-Diffusion/2D DarcyFlow/Compressible Navier-Stokes Equations
-
-The data generation codes are contained in
-[data_gen_NLE](./pdebench/data_gen/data_gen_NLE/):
-
-- `utils.py` util file for data generation, mainly boundary conditions and
-  initial conditions.
-- `AdvectionEq` directory with the source codes to generate 1D Advection
-  equation training samples
-- `BurgersEq` directory with the source codes to generate 1D Burgers equation
-  training samples
-- `CompressibleFluid` directory with the source codes to generate compressible
-  Navier-Stokes equations training samples
-
-  - `ReactionDiffusionEq` directory with the source codes to generate 1D
-    Reaction-Diffusion equation training samples (**Note:
-    [DarcyFlow data can be generated by run_DarcyFlow2D.sh](pdebench/data_gen/data_gen_NLE/README.md)
-    in this folder.**)
-
-- `save` directory saving the generated training samples
-
-A typical example to generate training samples (1D Advection Equation): (in
-`data_gen/data_gen_NLE/AdvectionEq/`)
+### 常用命令
 
 ```bash
-python3 advection_multi_solution_Hydra.py +multi=beta1e0.yaml
+# 訓練（pointwise ×4 + L1 + 梯度損失，3 通道資料）
+python train_unet_v2.py --data_path data/2D_rdb_NA_NA_.h5 --model miniunet \
+    --downsample pointwise --factor 4 --loss l1 --grad_loss_weight 0.5 \
+    --t_start 0 --t_end 20 --t_step 1 --out_dir outputs_miniunet
+
+# 只評估（不重訓，重算 bicubic / 1-NN / 線性內插 / LR 最近鄰 / U-Net）
+python train_unet_v2.py --eval_only --data_path data/2D_rdb_NA_NA_.h5 --out_dir outputs_miniunet
 ```
 
-which is assumed to be performed in each directory.
+## 最新結果摘要
 
-Examples for generating other PDEs are provided in `run_trainset.sh` in each
-PDE's directories. The config files for Hydra are stored in `config` directory
-in each PDE's directory.
+### 模型對照（隨機切分，1000 樣本、3 通道）
 
-#### Data Transformaion and Merge into HDF5 format
+| 方法 | PSNR (dB) | SSIM |
+|---|---|---|
+| Bicubic | 37.13 | 0.950 |
+| SRCNN | 51.03 | 0.996 |
+| **MiniUNet** | **57.43** | 0.999 |
+| UNet2d | 57.33 | 0.999 |
+| UNet2d wide | 56.08 | 0.999 |
+| 1-NN（oracle） | 57.54 | 0.998 |
+| 線性內插（oracle） | **57.92** | 0.999 |
 
-1D Advection/Burgers/Reaction-Diffusion/2D DarcyFlow/Compressible Navier-Stokes
-Equations save data as a numpy array. So, to read those data via our
-dataloaders, the data transformation/merge should be performed. This can be done
-using `data_gen_NLE/Data_Merge.py` whose config file is located at:
-`data_gen/data_gen_NLE/config/config.yaml`. After properly setting the
-parameters in the config file (type: name of PDEs, dim: number of
-spatial-dimension, bd: boundary condition), the corresponding HDF5 file could be
-obtained as:
-
-```bash
-python3 Data_Merge.py
-```
-
-## Configuration
-
-You can set the default values for data locations for this project by putting
-config vars like this in the `.env` file:
-
-```
-WORKING_DIR=~/Data/Working
-ARCHIVE_DATA_DIR=~/Data/Archive
-```
-
-There is an example in `example.env`.
-
-## Data Download
-
-The download scripts are provided in [data_download](./pdebench/data_download).
-There are two options to download data.
-
-1. Using `download_direct.py` (**recommended**)
-   - Retrieves data shards directly using URLs. Sample command for each PDE is
-     given in the README file in the [data_download](./pdebench/data_download)
-     directory.
-2. Using `download_easydataverse.py` (might be slow and you could encounter
-   errors/issues; hence, not recommended!)
-   - Use the config files from the `config` directory that contains the yaml
-     files storing the configuration. Any files in the dataset matching
-     `args.filename` will be downloaded into `args.data_folder`.
-
-## Baseline Models
-
-In this work, we provide three different ML models to be trained and evaluated
-against the benchmark datasets, namely
-[FNO](https://arxiv.org/pdf/2010.08895.pdf),
-[U-Net](https://www.sciencedirect.com/science/article/abs/pii/S0010482519301520?via%3Dihub),
-and [PINN](https://www.sciencedirect.com/science/article/pii/S0021999118307125).
-The codes for the baseline model implementations are contained in
-[models](./pdebench/models):
-
-- `train_models_forward.py` is the main script to train and evaluate the model.
-  It will call on model-specific script based on the input argument.
-- `train_models_inverse.py` is the main script to train and evaluate the model
-  for inverse problems. It will call on model-specific script based on the input
-  argument.
-- `metrics.py` is the script to evaluate the trained models based on various
-  evaluation metrics described in our paper. Additionally, it also plots the
-  prediction and target data.
-- `analyse_result_forward.py` is the script to convert the saved pickle file
-  from the metrics calculation script into pandas dataframe format and save it
-  as a CSV file. Additionally it also plots a bar chart to compare the results
-  between different models.
-- `analyse_result_inverse.py` is the script to convert the saved pickle file
-  from the metrics calculation script into pandas dataframe format and save it
-  as a CSV file. This script is used for the inverse problems. Additionally it
-  also plots a bar chart to compare the results between different models.
-- `fno` contains the scripts of FNO implementation. These are partly adapted
-  from the
-  [FNO repository](https://github.com/zongyi-li/fourier_neural_operator).
-- `unet` contains the scripts of U-Net implementation. These are partly adapted
-  from the
-  [U-Net repository](https://github.com/mateuszbuda/brain-segmentation-pytorch).
-- `pinn` contains the scripts of PINN implementation. These utilize the
-  [DeepXDE library](https://github.com/lululxvi/deepxde).
-- `inverse` contains the model for inverse model based on gradient.
-- `config` contains the yaml files for the model training input. The default
-  templates for different equations are provided in the
-  [args](./pdebench/models/config/args) directory. User just needs to copy and
-  paste them to the args keyword in the
-  [config.yaml](./pdebench/models/config/config.yaml) file.
-
-An example to run the forward model training can be found in
-[run_forward_1D.sh](./pdebench/models/run_forward_1D.sh), and an example to run
-the inverse model training can be found in
-[run_inverse.sh](./pdebench/models/run_inverse.sh).
-
-### Short explanations on the config args
-
-- model_name: string, containing the baseline model name, either 'FNO', 'Unet',
-  or 'PINN'.
-- if_training: bool, set True for training, or False for evaluation.
-- continue_training: bool, set True to continue training from a checkpoint.
-- num_workers: int, number of workers for the PyTorch dataloader.
-- batch_size: int, training batch size.
-- initial_step: int, number of time steps used as input for FNO and U-Net.
-- t_train: int, number of the last time step used for training (for
-  extrapolation testing, set this to be < Nt).
-- model_update: int, number of epochs to save model.
-- filename: str, has to match the dataset filename.
-- single_file: bool, set False for 2D diffusion-reaction, 1D diffusion-sorption,
-  and the radial dam break scenarios, and set True otherwise.
-- reduced_resolution: int, factor to downsample spatial resolution.
-- reduced_resolution_t: int, factor to downsample temporal resolution.
-- reduced_batch: int, factor to downsample sample size used for training.
-- epochs: int, total epochs used for training.
-- learning_rate: float, learning rate of the optimizer.
-- scheduler_step: int, number of epochs to update the learning rate scheduler.
-- scheduler_gamma: float, decay rate of the learning rate.
-
-#### U-Net specific args:
-
-- in_channels: int, number of input channels
-- out_channels: int, number of output channels
-- ar_mode: bool, set True for fully autoregressive or pushforward training.
-- pushforward: bool, set True for pushforward training, False otherwise (ar_mode
-  also has to be set True).
-- unroll_step: int, number of time steps to backpropagate in the pushforward
-  training.
-
-#### FNO specific args:
-
-- num_channels: int, number of channels (variables).
-- modes: int, number of Fourier modes to multiply.
-- width: int, number of channels for the Fourier layer.
-
-#### INVERSE specific args:
-
-- base_path: string, location of the data directory
-- training_type: string, type of training, autoregressive, single
-- mcmc_num_samples: int, number of generated samples
-- mcmc_warmup_steps: 10
-- mcmc_num_chains: 1
-- num_samples_max: 1000
-- in_channels_hid: 64
-- inverse_model_type: string, type of inverse inference model, ProbRasterLatent,
-  InitialConditionInterp
-- inverse_epochs: int, number of epochs for the gradient based method
-- inverse_learning_rate: float, learning rate for the gradient based method
-- inverse_verbose_flag: bool, some printing
-
-#### Plotting specific args:
-
-- plot: bool, set True to activate plotting.
-- channel_plot: int, determines which channel/variable to plot.
-- x_min: float, left spatial domain.
-- x_max: float, right spatial domain.
-- y_min: float, lower spatial domain.
-- y_max: float, upper spatial domain.
-- t_min: float, start of temporal domain.
-- t_max: float, end of temporal domain.
-
-## Datasets and pretrained models
-
-We provide the benchmark datasets we used in the paper through our
-[DaRUS data repository](https://darus.uni-stuttgart.de/dataset.xhtml?persistentId=doi:10.18419/darus-2986).
-The data generation configuration can be found in the paper. Additionally, the
-pretrained models are also available to be downloaded from
-[PDEBench Pretrained Models](https://darus.uni-stuttgart.de/dataset.xhtml?persistentId=doi:10.18419/darus-2987)
-DaRus repository. To use the pretrained models, users can specify the argument
-`continue_training: True` in the
-[config file](./pdebench/models/config/config.yaml).
-
----
-
-## Directory Tour
-
-Below is an illustration of the directory structure of PDEBench.
-
-```
-📂 pdebench
-|_📁 models
-  |_📁 pinn    # Model: Physics-Informed Neural Network
-    |_📄 train.py
-    |_📄 utils.py
-    |_📄 pde_definitions.py
-  |_📁 fno     # Model: Fourier Neural Operator
-    |_📄 train.py
-    |_📄 utils.py
-    |_📄 fno.py
-  |_📁 unet    # Model: U-Net
-    |_📄 train.py
-    |_📄 utils.py
-    |_📄 unet.py
-  |_📁 inverse # Model: Gradient-Based Inverse Method
-    |_📄 train.py
-    |_📄 utils.py
-    |_📄 inverse.py
-  |_📁 config  # Config: All config files reside here
-  |_📄 train_models_inverse.py
-  |_📄 run_forward_1D.sh
-  |_📄 analyse_result_inverse.py
-  |_📄 train_models_forward.py
-  |_📄 run_inverse.sh
-  |_📄 metrics.py
-  |_📄 analyse_result_forward.py
-|_📁 data_download  # Data: Scripts to download data from DaRUS
-  |_📁 config
-  |_📄 download_direct.py
-  |_📄 download_easydataverse.py
-  |_📄 visualize_pdes.py
-  |_📄 README.md
-  |_📄 download_metadata.csv
-|_📁 data_gen   # Data: Scripts to generate data
-  |_📁 configs
-  |_📁 data_gen_NLE
-  |_📁 src
-  |_📁 notebooks
-  |_📄 gen_diff_sorp.py
-  |_📄 plot.py
-  |_📄 example.env
-  |_📄 gen_ns_incomp.py
-  |_📄 gen_diff_react.py
-  |_📄 uploader.py
-  |_📄 gen_radial_dam_break.py
-|_📄 __init__.py
-```
-
----
-
-## Publications & Citations
-
-Please cite the following papers if you use PDEBench datasets and/or source code
-in your research.
-
-<details>
-<summary>
-    <a href="https://arxiv.org/abs/2210.07182">PDEBench: An Extensive Benchmark for Scientific Machine Learning - NeurIPS'2022 </a>
-</summary>
-<br/>
-
-```
-@inproceedings{PDEBench2022,
-author = {Takamoto, Makoto and Praditia, Timothy and Leiteritz, Raphael and MacKinlay, Dan and Alesiani, Francesco and Pflüger, Dirk and Niepert, Mathias},
-title = {{PDEBench: An Extensive Benchmark for Scientific Machine Learning}},
-year = {2022},
-booktitle = {36th Conference on Neural Information Processing Systems (NeurIPS 2022) Track on Datasets and Benchmarks},
-url = {https://arxiv.org/abs/2210.07182}
-}
-```
-
-</details>
-
-<details>
-<summary>
-    <a href="https://doi.org/10.18419/darus-2986">PDEBench Datasets - NeurIPS'2022 </a>
-</summary>
-<br/>
-
-```
-@data{darus-2986_2022,
-author = {Takamoto, Makoto and Praditia, Timothy and Leiteritz, Raphael and MacKinlay, Dan and Alesiani, Francesco and Pflüger, Dirk and Niepert, Mathias},
-publisher = {DaRUS},
-title = {{PDEBench Datasets}},
-year = {2022},
-doi = {10.18419/darus-2986},
-url = {https://doi.org/10.18419/darus-2986}
-}
-```
-
-</details>
-
-<details>
-<summary>
-    <a href="https://arxiv.org/abs/2304.14118">Learning Neural PDE Solvers with Parameter-Guided Channel Attention - ICML'2023 </a>
-</summary>
-<br/>
-
-```
-@article{cape-takamoto:2023,
-     author   = {Makoto Takamoto and
-                 Francesco Alesiani and
-                 Mathias Niepert},
- title        = {Learning Neural {PDE} Solvers with Parameter-Guided Channel Attention},
- journal      = {CoRR},
- volume       = {abs/2304.14118},
- year         = {2023},
- url          = {https://doi.org/10.48550/arXiv.2304.14118},
- doi          = {10.48550/arXiv.2304.14118},
- eprinttype    = {arXiv},
- eprint       = {2304.14118},
- }
-```
-
-</details>
-
-<details>
-<summary>
-    <a href="https://openreview.net/forum?id=I4WlXAA9Gd"> Vectorized Conditional Neural Fields: A Framework for Solving Time-dependent Parametric Partial Differential Equations - ICLR-W'2024 & ICML'2024 </a>
-</summary>
-<br/>
-
-```
-@inproceedings{vcnef-vectorized-conditional-neural-fields-hagnberger:2024,
-author = {Hagnberger, Jan and Kalimuthu, Marimuthu and Musekamp, Daniel and Niepert, Mathias},
-title = {{Vectorized Conditional Neural Fields: A Framework for Solving Time-dependent Parametric Partial Differential Equations}},
-year = {2024},
-booktitle = {Proceedings of the 41st International Conference on Machine Learning (ICML 2024)}
-}
-```
-
-</details>
-
-<details>
-<summary>
-    <a href="https://arxiv.org/abs/2408.01536"> Active Learning for Neural PDE Solvers - ICLR-2025 </a>
-</summary>
-<br/>
-
-```
-@article{active-learn-neuralpde-benchmark-musekamp:2025,
- author       = {Daniel Musekamp and
-                 Marimuthu Kalimuthu and
-                 David Holzm{\"{u}}ller and
-                 Makoto Takamoto and
-                 Mathias Niepert},
- title        = {Active Learning for Neural {PDE} Solvers},
- booktitle    = {The Thirteenth International Conference on Learning Representations (ICLR)},
- year         = {2025},
- url          = {https://openreview.net/forum?id=x4ZmQaumRg}
-}
-```
-
-</details>
-
-<details>
-<summary>
-    <a href="https://arxiv.org/abs/2504.04260"> LOGLO-FNO: Efficient Learning of Local and Global Features in Fourier Neural Operators - TMLR-2025 </a>
-</summary>
-<br/>
-
-```
-@article{loglo-fno-local-global-spectral-conv-kalimuthu:2025,
-title   = {{LOGLO}-{FNO}: Efficient Learning of Local and Global Features in Fourier Neural Operators},
-author  = {Marimuthu Kalimuthu and David Holzm{\"u}ller and Mathias Niepert},
-journal = {Transactions on Machine Learning Research},
-issn    = {2835-8856},
-year    = {2025},
-url     = {https://openreview.net/forum?id=MQ1dRdHTpi},
-note    = {J2C Certification}
-}
-```
-
-</details>
-
----
-
-## Code contributors
-
-- [Makato Takamoto](https://github.com/mtakamoto-D)
-  ([NEC laboratories Europe](https://www.neclab.eu/))
-- [Timothy Praditia](https://github.com/timothypraditia)
-  ([Stuttgart Center for Simulation Science | University of Stuttgart](https://www.simtech.uni-stuttgart.de/))
-- [Raphael Leiteritz](https://github.com/leiterrl)
-  ([Stuttgart Center for Simulation Science | University of Stuttgart](https://www.simtech.uni-stuttgart.de/))
-- [Francesco Alesiani](https://github.com/falesiani)
-  ([NEC laboratories Europe](https://www.neclab.eu/))
-- [Dan MacKinlay](https://danmackinlay.name/)
-  ([CSIRO’s Data61](https://data61.csiro.au/))
-- [Marimuthu Kalimuthu](https://github.com/kmario23)
-  ([Stuttgart Center for Simulation Science | University of Stuttgart](https://www.simtech.uni-stuttgart.de/))
-- [John Kim](https://github.com/johnmjkim)
-  ([ANU TechLauncher](https://comp.anu.edu.au/TechLauncher/)/[CSIRO’s Data61](https://data61.csiro.au/))
-- [Gefei Shan](https://github.com/davecatmeow)
-  ([ANU TechLauncher](https://comp.anu.edu.au/TechLauncher/)/[CSIRO’s Data61](https://data61.csiro.au/))
-- [Yizhou Yang](https://github.com/verdantwynnd)
-  ([ANU TechLauncher](https://comp.anu.edu.au/TechLauncher/)/[CSIRO’s Data61](https://data61.csiro.au/))
-- [Ran Zhang](https://github.com/maphyca)
-  ([ANU TechLauncher](https://comp.anu.edu.au/TechLauncher/)/[CSIRO’s Data61](https://data61.csiro.au/))
-- [Simon Brown](https://github.com/SimonSyBrown)
-  ([ANU TechLauncher](https://comp.anu.edu.au/TechLauncher/)/[CSIRO’s Data61](https://data61.csiro.au/))
-
-## License
-
-MIT licensed, except where otherwise stated. See `LICENSE.txt` file.
+**核心結論**：U-Net 逼近但未超越「參數內插」oracle；噪聲下 LR 最近鄰勝過 U-Net；此平滑資料對深度學習過於簡單。詳見 [04-progress.md](./04-progress.md)。

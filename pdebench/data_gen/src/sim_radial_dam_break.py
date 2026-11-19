@@ -90,9 +90,13 @@ class Basic2DScenario(ABC):
         T = np.asarray(self.save_state["t"])
         X = np.asarray(self.save_state["x"])
         Y = np.asarray(self.save_state["y"])
+        # 方向 D：多通道，同時存 h / u / v（水位 + 兩個方向的流速）
         H = np.expand_dims(np.asarray(self.save_state["h"]), -1)
+        U = np.expand_dims(np.asarray(self.save_state["u"]), -1)
+        V = np.expand_dims(np.asarray(self.save_state["v"]), -1)
+        data = np.concatenate([H, U, V], axis=-1)   # [T, H, W, 3]
 
-        data_f.create_dataset(f"{seed_str}/data", data=H, dtype="f")
+        data_f.create_dataset(f"{seed_str}/data", data=data, dtype="f")
         data_f.create_dataset(f"{seed_str}/grid/x", data=X, dtype="f")
         data_f.create_dataset(f"{seed_str}/grid/y", data=Y, dtype="f")
         data_f.create_dataset(f"{seed_str}/grid/t", data=T, dtype="f")
@@ -201,7 +205,7 @@ class RadialDamBreak2D(Basic2DScenario):
         y0 = 0.0
         X, Y = self.claw_state.p_centers
         r = np.sqrt((X - x0) ** 2 + (Y - y0) ** 2)
-        h_in = 2.0
+        h_in = self.inner_height
         h_out = 1.0
 
         self.claw_state.q[self.depthId, :, :] = h_in * (
