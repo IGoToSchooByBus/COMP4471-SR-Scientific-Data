@@ -121,4 +121,4 @@ python train_unet_v2.py --eval_only --data_path data/2D_rdb_NA_NA_.h5 --out_dir 
 | 1-NN（oracle） | 57.54 | 0.998 |
 | 線性內插（oracle） | **57.92** | 0.999 |
 
-**核心結論**：U-Net 逼近但未超越「參數內插」oracle；噪聲下 LR 最近鄰勝過 U-Net；此平滑資料對深度學習過於簡單。詳見 [04-progress.md](./04-progress.md)。
+**核心結論**：參數外推時 U-Net（50.87 dB）遠勝 oracle（26.15 dB）；噪聲有「交叉點」（低噪聲 LR 最近鄰勝、高噪聲 U-Net 反超）；時間外推晚→早更難。詳見 [04-progress.md](./04-progress.md)。

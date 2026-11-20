@@ -7,6 +7,13 @@ pdebench/ab_*/
 pdebench/drive-download*/
 *.pt
 
+# 舊腳本（被 train_unet_v2.py 取代）
+pdebench/train_unet.py
+pdebench/bicubic_baseline_revised.py
+pdebench/run_bicubic_baseline.py
+pdebench/run_experiments.bat
+pdebench/movie_swe.gif
+
 # Python
 __pycache__/
 *.pyc

@@ -46,7 +46,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split, Subset
 from skimage.metrics import (
     mean_squared_error,
     peak_signal_noise_ratio,
@@ -84,7 +84,7 @@ def load_swe_representative(path: str, t_index: int = 0):
 def load_swe_timeseries(path: str, sim_indices, t_start: int = 0, t_end: int = 100, t_step: int = 1):
     """只載入「指定模擬」的完整時間序列（省記憶體），回傳 [len(sim_indices), T_sel, H, W]。
 
-    方向 D：1000 筆其實只有 81 場唯一模擬；先挑出唯一代表再載時間序列，避免一次載 6 GB。
+    方向 D：1000 場都唯一（2 參數 dam_radius × inner_height）；每場 21 幀。
     """
     t_idx = list(range(t_start, t_end + 1, t_step))
     with h5py.File(path, "r") as f:
@@ -144,8 +144,12 @@ def block_average_downsample(hr: np.ndarray, factor: int = 4):
 
 
 def pointwise(hr: np.ndarray, factor: int = 4):
-    """pointwise 隔行取樣：每 factor 個像素只取 1 個，無反鋸齒 → 產生 aliasing（方向 B 的難題）。"""
-    return hr[::factor, ::factor].copy()
+    """pointwise 隔行取樣：每 factor 個像素只取 1 個，無反鋸齒 → 產生 aliasing（方向 B 的難題）。
+    取樣偏移 factor//2：對齊 bicubic(align_corners=False) 把 LR pixel i 放在 HR 座標 f·i + f/2 − 0.5，
+    把全域位移從 f/2 − 0.5 降到 0.5 px（factor=4：1.5 px → 0.5 px）。
+    （對齊測試：hr[::4] 的 bicubic 被位移懲罰 3.5 dB；hr[2::4] 回升 +3.52 dB。）"""
+    off = factor // 2
+    return hr[off::factor, off::factor].copy()
 
 
 def get_downsample_fn(name: str):
@@ -387,7 +391,7 @@ def compute_parameter_baselines(train_hr, train_params, test_hr, test_params, da
     tr_n = (train_params - pmin) / (pmax - pmin + 1e-12)
     te_n = (test_params - pmin) / (pmax - pmin + 1e-12)
     T = train_hr.shape[1]
-    agg = {"1NN": {"MSE": [], "PSNR": [], "SSIM": []}, "linear": {"MSE": [], "PSNR": [], "SSIM": []}}
+    agg = {"1NN": {"MSE": [], "PSNR": [], "SSIM": []}, "inv_dist": {"MSE": [], "PSNR": [], "SSIM": []}}
     for i in range(len(test_params)):
         d = np.linalg.norm(tr_n - te_n[i], axis=1)
         order = np.argsort(d)
@@ -401,8 +405,100 @@ def compute_parameter_baselines(train_hr, train_params, test_hr, test_params, da
             mn = compute_metrics_multichannel(gt, nn, data_range)
             ml = compute_metrics_multichannel(gt, lin, data_range)
             for k in ("MSE", "PSNR", "SSIM"):
-                agg["1NN"][k].append(mn[k]); agg["linear"][k].append(ml[k])
-    return {name: {k: float(np.nanmean(v)) for k, v in agg[name].items()} for name in ("1NN", "linear")}
+                agg["1NN"][k].append(mn[k]); agg["inv_dist"][k].append(ml[k])
+    return {name: {k: float(np.nanmean(v)) for k, v in agg[name].items()} for name in ("1NN", "inv_dist")}
+
+
+def compute_linear_extrapolation_baseline(train_hr, train_params, test_hr, test_params, data_range):
+    """線性外推 baseline：對每個時間步、每個像素獨立擬合「場 ≈ w0 + w1·dam_radius + w2·inner_height」，
+    再外推到測試參數。和凸組合（1-NN/線性內插）不同，它可以「超出」訓練參數範圍（真外推）。
+
+    train_hr: [n_train, T, H, W, C]; train_params: [n_train, 2]
+    test_hr: [n_test, T, H, W, C]; test_params: [n_test, 2]
+    回傳 {'global_lin_extrap': {...}}（MSE/PSNR/SSIM）。
+    """
+    n_train = len(train_params)
+    T = train_hr.shape[1]
+    shape = train_hr.shape[2:]   # (H, W, C)
+    D = int(np.prod(shape))
+
+    # 設計矩陣（截距 + 兩參數）
+    X = np.column_stack([np.ones(n_train), train_params[:, 0], train_params[:, 1]])   # [n_train, 3]
+    XtX_inv_Xt = np.linalg.solve(X.T @ X + 1e-10 * np.eye(3), X.T)   # [3, n_train]，小正則避免奇異
+
+    lin_mse, lin_psnr, lin_ssim = [], [], []
+    for t in range(T):
+        Y = train_hr[:, t].reshape(n_train, D).astype(np.float64)   # [n_train, D]
+        W = XtX_inv_Xt @ Y   # [3, D]（每像素最小平方解）
+        for i in range(len(test_params)):
+            x = np.array([1.0, test_params[i, 0], test_params[i, 1]], dtype=np.float64)
+            pred = (x @ W).reshape(shape)   # [H, W, C]
+            gt = test_hr[i, t]
+            m = compute_metrics_multichannel(gt.transpose(2, 0, 1), pred.transpose(2, 0, 1), data_range)
+            lin_mse.append(m["MSE"]); lin_psnr.append(m["PSNR"]); lin_ssim.append(m["SSIM"])
+    return {"global_lin_extrap": {
+        "MSE": float(np.nanmean(lin_mse)),
+        "PSNR": float(np.nanmean(lin_psnr)),
+        "SSIM": float(np.nanmean(lin_ssim)),
+    }}
+
+
+def compute_local_linear_extrapolation_baseline(train_hr, train_params, test_hr, test_params, data_range, k=32):
+    """局部線性外推 baseline：用參數接近測試點的訓練場擬合線性模型再外推。
+
+    - 測試點在訓練範圍「內」→ 用 k 個最近鄰（leverage 低，安全）。
+    - 測試點在訓練範圍「外」（extrap）→ 改用 r 最上面的 band（r ≥ r_max − 0.05），
+      避免 kNN 全擠在邊界導致 leverage 爆炸（reviewer 實測：kNN k=32 的 leverage = 311，
+      band r≥r_max−0.05 的 leverage ≈ 2.8）。
+    - fit 用歸一化參數 + ridge（λ=1e-2），並在結束時印預測範圍檢查數值爆炸。
+    """
+    pmin = train_params.min(axis=0)
+    pmax = train_params.max(axis=0)
+    tr_n = (train_params - pmin) / (pmax - pmin + 1e-12)
+    te_n = (test_params - pmin) / (pmax - pmin + 1e-12)
+    r_max = float(train_params[:, 0].max())
+    T = train_hr.shape[1]
+    shape = train_hr.shape[2:]
+    D = int(np.prod(shape))
+    k = min(k, len(train_params))
+
+    # 外推用的 band：所有 test sim 共用同一個 sel → fit 只算 T 次（不重複 N_test 次）
+    band_sel = np.where(train_params[:, 0] >= r_max - 0.05)[0]
+    X_band = np.column_stack([np.ones(len(band_sel)), tr_n[band_sel, 0], tr_n[band_sel, 1]])
+    XtX_inv_Xt_band = np.linalg.solve(X_band.T @ X_band + 1e-2 * np.eye(3), X_band.T)
+    W_band = [XtX_inv_Xt_band @ train_hr[band_sel, t].reshape(len(band_sel), D).astype(np.float64)
+              for t in range(T)]   # 每個 t 一個 [3, D]
+
+    mse_list, psnr_list, ssim_list = [], [], []
+    pred_min_all, pred_max_all = np.inf, -np.inf
+    for i in range(len(test_params)):
+        x = np.array([1.0, te_n[i, 0], te_n[i, 1]], dtype=np.float64)
+        if test_params[i, 0] > r_max:   # 外推：用預先 fit 好的 band W
+            for t in range(T):
+                pred = (x @ W_band[t]).reshape(shape)
+                pred_min_all = min(pred_min_all, float(pred.min()))
+                pred_max_all = max(pred_max_all, float(pred.max()))
+                m = compute_metrics_multichannel(test_hr[i, t].transpose(2, 0, 1), pred.transpose(2, 0, 1), data_range)
+                mse_list.append(m["MSE"]); psnr_list.append(m["PSNR"]); ssim_list.append(m["SSIM"])
+        else:                            # 內插：kNN（每個 test sim 的 sel 不同，只能在迴圈內 fit）
+            d = np.linalg.norm(tr_n - te_n[i], axis=1)
+            sel = np.argsort(d)[:k]
+            X = np.column_stack([np.ones(len(sel)), tr_n[sel, 0], tr_n[sel, 1]])
+            XtX_inv_Xt = np.linalg.solve(X.T @ X + 1e-2 * np.eye(3), X.T)
+            for t in range(T):
+                Y = train_hr[sel, t].reshape(len(sel), D).astype(np.float64)
+                W = XtX_inv_Xt @ Y
+                pred = (x @ W).reshape(shape)
+                pred_min_all = min(pred_min_all, float(pred.min()))
+                pred_max_all = max(pred_max_all, float(pred.max()))
+                m = compute_metrics_multichannel(test_hr[i, t].transpose(2, 0, 1), pred.transpose(2, 0, 1), data_range)
+                mse_list.append(m["MSE"]); psnr_list.append(m["PSNR"]); ssim_list.append(m["SSIM"])
+    print(f"[local_lin_extrap] pred range: [{pred_min_all:.3f}, {pred_max_all:.3f}]（真值應約在 [-1, 2.5]；超出過多 = 數值爆炸）")
+    return {"local_lin_extrap": {
+        "MSE": float(np.nanmean(mse_list)),
+        "PSNR": float(np.nanmean(psnr_list)),
+        "SSIM": float(np.nanmean(ssim_list)),
+    }}
 
 
 def compute_lr_nn_baseline(train_lr, train_hr, test_lr, test_hr, data_range):
@@ -445,9 +541,9 @@ def save_comparison(out_path, hr, lr, bicubic, pred):
     fig, axs = plt.subplots(1, 5, figsize=(16, 3.4), constrained_layout=True)
     panels = [
         ("Ground truth", hr, "bilinear"),
-        ("LR (低解析)", lr, "nearest"),
+        ("LR (32x32)", lr, "nearest"),
         ("Bicubic", bicubic, "nearest"),
-        ("U-Net", pred, "nearest"),
+        ("model", pred, "nearest"),
     ]
     for ax, (title, data, interp) in zip(axs[:4], panels):
         im = ax.imshow(data, cmap="viridis", interpolation=interp, vmin=vmin, vmax=vmax)
@@ -467,6 +563,18 @@ def save_comparison(out_path, hr, lr, bicubic, pred):
 # --------------------------------------------------------------------------- #
 # 6. 評估 + 輸出（訓練後與 --eval_only 共用）
 # --------------------------------------------------------------------------- #
+def _json_safe(obj):
+    """把 NaN / inf 換成 None（嚴格 JSON 不允許 NaN/inf）。"""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        f = float(obj)
+        return f if np.isfinite(f) else None
+    return obj
+
+
 def evaluate_and_save(
     model, test_loader, test_raw, mean, std, data_range, factor, args, n_val, device,
     train_min, train_max, baselines=None,
@@ -498,6 +606,9 @@ def evaluate_and_save(
                 hr_raw_first = hr_raw[0, 0].cpu().numpy()
                 lr_raw_first = lr_raw[0, 0].cpu().numpy()
 
+    pooled_r = float(train_max - train_min)   # pooled signal range（全資料的 max-min，不是各通道 range 的平均）
+    n_groups_test = int(getattr(args, "n_test_groups", 0) or 0)
+    T_per = (len(mse_list) // n_groups_test) if (n_groups_test > 0 and len(mse_list) % n_groups_test == 0) else 0
     model_summary = {
         "method": f"bicubic + {args.model} residual ({args.loss} loss, grad_weight={args.grad_loss_weight})",
         "model": args.model,
@@ -505,9 +616,11 @@ def evaluate_and_save(
         "n_test": len(mse_list),
         "factor": factor,
         "data_range": np.asarray(data_range).tolist(),
-        "MSE": float(np.mean(mse_list)),
-        "PSNR": float(np.mean(psnr_list)),
+        "MSE": float(np.mean(mse_list)),   # pooled MSE（所有像素匯總，含 t=0 誤差）
+        "PSNR": float(np.mean(psnr_list)),   # 逐樣本 PSNR 平均（t=0 零變異數跳過）
+        "pooled_PSNR": float(10.0 * np.log10(pooled_r ** 2 / float(np.mean(mse_list)))) if float(np.mean(mse_list)) > 0 else float("inf"),   # pooled PSNR（誠實，含 t=0）
         "PSNR_per_channel": [float(x) for x in np.nanmean(psnr_per_ch_list, axis=0)] if psnr_per_ch_list else [],
+        "MSE_by_time": [float(x) for x in np.array(mse_list).reshape(n_groups_test, T_per).mean(axis=0)] if T_per > 1 else [],   # 逐幀 MSE（暴露 t=0 失敗）
         "SSIM": float(np.mean(ssim_list)),
         "MAE": float(np.mean(mae_list)),
         "MaxError": float(np.mean(maxerr_list)),
@@ -531,17 +644,19 @@ def evaluate_and_save(
         "data_range": np.asarray(data_range).tolist(),
         "MSE": float(np.mean(bic_mse)),
         "PSNR": float(np.mean(bic_psnr)),
+        "pooled_PSNR": float(10.0 * np.log10(pooled_r ** 2 / float(np.mean(bic_mse)))) if float(np.mean(bic_mse)) > 0 else float("inf"),
         "PSNR_per_channel": [float(x) for x in np.nanmean(bic_psnr_per_ch_list, axis=0)] if bic_psnr_per_ch_list else [],
         "SSIM": float(np.mean(bic_ssim)),
         "MAE": float(np.mean(bic_mae)),
         "MaxError": float(np.mean(bic_maxerr)),
+        "MSE_by_time": [float(x) for x in np.array(bic_mse).reshape(n_groups_test, T_per).mean(axis=0)] if T_per > 1 else [],
     }
     if bicubic_first is None and hr_raw_first is not None:
         bicubic_first = bicubic_upsample_raw(noisy_lr_all[0][..., 0], hr_raw_first.shape)
 
     # ---- group-level 統計（每場模擬平均，避免把相關幀當獨立樣本） ----
     n_groups = int(getattr(args, "n_test_groups", 0) or 0)
-    T_sel = (len(mse_list) // n_groups) if n_groups > 0 else 0
+    T_sel = (len(mse_list) // n_groups) if (n_groups > 0 and len(mse_list) % n_groups == 0) else 0
     group_summary = {}
     if T_sel > 1:
         psnr_arr = np.array(psnr_list, dtype=np.float64).reshape(n_groups, T_sel)
@@ -568,13 +683,17 @@ def evaluate_and_save(
         "n_channels": int(getattr(args, "n_channels", 1)),
     }
     with open(args.out_dir / "train_stats.json", "w", encoding="utf-8") as f:
-        json.dump(train_stats, f, indent=2, ensure_ascii=False)
+        json.dump(_json_safe(train_stats), f, indent=2, ensure_ascii=False)
     with open(args.out_dir / "model_summary.json", "w", encoding="utf-8") as f:
-        json.dump(model_summary, f, indent=2)
+        json.dump(_json_safe(model_summary), f, indent=2)
     with open(args.out_dir / "bicubic_summary.json", "w", encoding="utf-8") as f:
-        json.dump(bicubic_summary, f, indent=2)
+        json.dump(_json_safe(bicubic_summary), f, indent=2)
+    if baselines:
+        for _name, _v in baselines.items():
+            if _v.get("MSE") is not None and _v["MSE"] > 0:
+                _v["pooled_PSNR"] = float(10.0 * np.log10(pooled_r ** 2 / _v["MSE"]))
     with open(args.out_dir / "baselines.json", "w", encoding="utf-8") as f:
-        json.dump({"baselines": baselines, "group_summary": group_summary}, f, indent=2, allow_nan=True)
+        json.dump(_json_safe({"baselines": baselines, "group_summary": group_summary}), f, indent=2)
     with open(args.out_dir / "model_per_sample.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["test_index", "MSE", "PSNR", "SSIM", "MAE", "MaxError"])
@@ -586,15 +705,17 @@ def evaluate_and_save(
             hr_raw_first, lr_raw_first, bicubic_first, pred_raw_first,
         )
 
-    # ---- 總結 ----
+    # ---- 總結（同時印逐樣本 PSNR 與 pooled PSNR） ----
     n_frames_label = f"{n_groups} 場模擬 / {len(test_raw)} 幀" if n_groups else f"{len(test_raw)} 筆"
     print(f"\n===== 結果對比（{n_frames_label}） =====")
-    print(f"{'方法':<22}{'MSE':>12}{'PSNR':>9}{'SSIM':>9}{'MaxErr':>12}")
-    print(f"{'Bicubic':<22}{bicubic_summary['MSE']:>12.6f}{bicubic_summary['PSNR']:>9.2f}{bicubic_summary['SSIM']:>9.4f}{bicubic_summary['MaxError']:>12.6f}")
+    print(f"{'方法':<20}{'MSE':>12}{'PSNR':>8}{'pooled':>8}{'SSIM':>9}")
+    print(f"{'Bicubic':<20}{bicubic_summary['MSE']:>12.6f}{bicubic_summary['PSNR']:>8.2f}{bicubic_summary.get('pooled_PSNR', float('nan')):>8.2f}{bicubic_summary['SSIM']:>9.4f}")
     if baselines:
-        print(f"{'1-NN (oracle)':<22}{baselines['1NN']['MSE']:>12.6f}{baselines['1NN']['PSNR']:>9.2f}{baselines['1NN']['SSIM']:>9.4f}{'—':>12}")
-        print(f"{'linear interp':<22}{baselines['linear']['MSE']:>12.6f}{baselines['linear']['PSNR']:>9.2f}{baselines['linear']['SSIM']:>9.4f}{'—':>12}")
-    print(f"{'U-Net':<22}{model_summary['MSE']:>12.6f}{model_summary['PSNR']:>9.2f}{model_summary['SSIM']:>9.4f}{model_summary['MaxError']:>12.6f}")
+        for _n in ("1NN", "inv_dist", "global_lin_extrap", "local_lin_extrap", "LR_1NN"):
+            if _n in baselines:
+                _v = baselines[_n]
+                print(f"{_n:<20}{_v['MSE']:>12.6f}{_v['PSNR']:>8.2f}{_v.get('pooled_PSNR', float('nan')):>8.2f}{_v['SSIM']:>9.4f}")
+    print(f"{args.model:<20}{model_summary['MSE']:>12.6f}{model_summary['PSNR']:>8.2f}{model_summary.get('pooled_PSNR', float('nan')):>8.2f}{model_summary['SSIM']:>9.4f}")
     if group_summary:
         print(f"\nGroup-level：{group_summary['n_test_groups']} 場模擬的 PSNR = {group_summary['PSNR_mean']:.2f} ± {group_summary['PSNR_std']:.2f} dB")
     print(f"輸出目錄：{args.out_dir.resolve()}")
@@ -603,6 +724,23 @@ def evaluate_and_save(
 # --------------------------------------------------------------------------- #
 # 7. 只評估（不訓練）：讀 checkpoint 直接出結果
 # --------------------------------------------------------------------------- #
+def _reconstruct_train_groups(n_unique, ts, ckpt, group_params, test_mask):
+    """eval_only 重建訓練群組：優先用 checkpoint 存的 train_group_ids；
+    舊 checkpoint 沒存 → 按 split_mode 重建（避免把 extrapolate/middle 排除的 band 當成訓練集）。"""
+    train_group_ids = [int(g) for g in ts.get("train_group_ids", [])]
+    if train_group_ids:
+        return np.array(sorted(train_group_ids), dtype=np.int64)
+    split_mode = ckpt.get("args", {}).get("split_mode", "random")
+    tr_max = float(ckpt.get("args", {}).get("train_radius_max") or 0)
+    te_min = float(ckpt.get("args", {}).get("test_radius_min") or 0)
+    rep_radius = group_params[:, 0]
+    if split_mode == "extrapolate" and tr_max > 0:
+        return np.where(rep_radius <= tr_max)[0]
+    if split_mode == "middle" and tr_max > 0 and te_min > 0:
+        return np.where((rep_radius <= tr_max) | (rep_radius >= te_min))[0]
+    return np.where(~test_mask)[0]
+
+
 def run_eval_only(args, device):
     ckpt_path = Path(args.ckpt) if args.ckpt else args.out_dir / "model_best.pt"
     if not ckpt_path.exists():
@@ -619,6 +757,7 @@ def run_eval_only(args, device):
     args.t_end = int(ts.get("t_end", args.t_end))
     args.t_step = int(ts.get("t_step", args.t_step))
     args.noise_std = float(ts.get("noise_std", args.noise_std))
+    args.seed = int(ckpt.get("args", {}).get("seed", args.seed))   # 還原訓練 seed（存在 ckpt["args"]，不在 train_stats）
     factor = int(ts.get("factor", args.factor))
     args.downsample = ts.get("downsample", args.downsample)
     args.loss = ts.get("loss", args.loss)
@@ -649,7 +788,7 @@ def run_eval_only(args, device):
             test_group_ids = set(int(g) for g in ts.get("test_group_ids", []))
             test_group_arr = np.array(sorted(test_group_ids), dtype=np.int64)
             test_mask = np.isin(np.arange(n_unique), test_group_arr)
-            train_groups = np.where(~test_mask)[0]
+            train_groups = _reconstruct_train_groups(n_unique, ts, ckpt, group_params, test_mask)
             test_groups = np.where(test_mask)[0]
             if temporal_split == "head":
                 train_raw = full[train_groups][:, :K].reshape(-1, *full.shape[2:])
@@ -673,15 +812,30 @@ def run_eval_only(args, device):
         test_group_ids = set(int(g) for g in ts.get("test_group_ids", []))
         test_group_arr = np.array(sorted(test_group_ids), dtype=np.int64)
         test_mask = np.isin(np.arange(n_unique), test_group_arr)
-        train_raw = full[~test_mask].reshape(-1, *full.shape[2:])
+        train_groups = _reconstruct_train_groups(n_unique, ts, ckpt, group_params, test_mask)
+        train_mask = np.isin(np.arange(n_unique), train_groups)
+        train_raw = full[train_mask].reshape(-1, *full.shape[2:])
         test_raw = full[test_mask].reshape(-1, *full.shape[2:])
-        train_groups = np.where(~test_mask)[0]
         test_groups = np.where(test_mask)[0]
-        baselines = compute_parameter_baselines(
-            full[train_groups], group_params[train_groups],
-            full[test_groups], group_params[test_groups],
-            data_range,
-        )
+        args.n_test_groups = len(test_groups)
+        if args.skip_baselines:
+            baselines = None
+        else:
+            baselines = compute_parameter_baselines(
+                full[train_groups], group_params[train_groups],
+                full[test_groups], group_params[test_groups],
+                data_range,
+            )
+            baselines.update(compute_linear_extrapolation_baseline(
+                full[train_groups], group_params[train_groups],
+                full[test_groups], group_params[test_groups],
+                data_range,
+            ))
+            baselines.update(compute_local_linear_extrapolation_baseline(
+                full[train_groups], group_params[train_groups],
+                full[test_groups], group_params[test_groups],
+                data_range, k=32,
+            ))
     n_val = len(train_raw) - int((1 - args.val_frac) * len(train_raw))
     print(f"eval_only：{temporal_split if temporal_split != 'none' else 'random'} 切分，train {len(train_raw)} / test {len(test_raw)} 個樣本")
 
@@ -715,7 +869,7 @@ def main():
     p = argparse.ArgumentParser(description="工程化 U-Net 超解析度訓練（方向 A + B）")
     p.add_argument("--data_path", type=str, default="data/2D_rdb_NA_NA.h5")
     p.add_argument("--t_start", type=int, default=0, help="使用的起始時間步（方向 D：多時間步）")
-    p.add_argument("--t_end", type=int, default=100, help="使用的結束時間步（含）")
+    p.add_argument("--t_end", type=int, default=20, help="使用的結束時間步（含）。21 幀資料用 20；101 幀資料用 100")
     p.add_argument("--t_step", type=int, default=1, help="時間步間隔（>1 可降低相鄰幀相關性與成本）")
     p.add_argument("--noise_std", type=float, default=0.0, help="加到 LR 的量測雜訊標準差（方向 D，0=不加）")
     p.add_argument("--data_range", type=float, default=None, help="固定 PSNR 的 data_range R（預設從訓練集算）。固定它才能跨實驗比 PSNR")
@@ -747,6 +901,7 @@ def main():
     p.add_argument("--out_dir", type=Path, default=Path("outputs_unet_v2"))
     p.add_argument("--resume", type=str, default=None, help="從 checkpoint 繼續訓練")
     p.add_argument("--eval_only", action="store_true", help="不訓練，只讀 checkpoint 做評估")
+    p.add_argument("--skip_baselines", action="store_true", help="不計算 baselines（多模型共用同一組 baseline 時，只對第一個模型算）")
     p.add_argument("--ckpt", type=str, default=None, help="評估用的 checkpoint（預設 out_dir/model_best.pt）")
     args = p.parse_args()
 
@@ -794,7 +949,7 @@ def main():
     n_test_groups = len(test_groups)
     test_group_ids = sorted(int(g) for g in test_groups)
 
-    # ---- 只載入「唯一組」的完整時間序列（81 場，不是 1000 場，省 ~12 倍記憶體） ----
+    # ---- 只載入「唯一組」的完整時間序列（1000 場唯一，每場 21 幀，全載 ~4.1GB） ----
     rep_sim_idx = np.array([np.where(gids == g)[0][0] for g in range(n_unique)], dtype=np.int64)
     full = load_swe_timeseries(args.data_path, rep_sim_idx.tolist(), args.t_start, args.t_end, args.t_step)  # [n_unique, T_sel, H, W, C]
     T_sel = full.shape[1]
@@ -849,23 +1004,48 @@ def main():
         data_range = np.full(C, args.data_range, dtype=np.float64)   # 固定 R，跨實驗可比
     print(f"train mean={np.round(mean, 6)}, std={np.round(std, 6)}, data_range={np.round(data_range, 6)}")
 
-    # ---- 1-NN / 線性內插 baseline（oracle；時間切分時不適用，因為需要「同時刻」訓練場） ----
-    if args.temporal_split == "none":
+    # ---- baseline（oracle 1-NN/線性內插 + 線性外推；時間切分時不適用，因為需要「同時刻」訓練場） ----
+    if args.skip_baselines:
+        baselines = None
+    elif args.temporal_split == "none":
         baselines = compute_parameter_baselines(
             full[train_groups], group_params[train_groups],
             full[test_groups], group_params[test_groups],
             data_range,
         )
+        baselines.update(compute_linear_extrapolation_baseline(
+            full[train_groups], group_params[train_groups],
+            full[test_groups], group_params[test_groups],
+            data_range,
+        ))
+        baselines.update(compute_local_linear_extrapolation_baseline(
+            full[train_groups], group_params[train_groups],
+            full[test_groups], group_params[test_groups],
+            data_range, k=32,
+        ))
     else:
         baselines = None
     print(f"downsample={args.downsample}, loss={args.loss}, grad_loss_weight={args.grad_loss_weight}, channels={C}")
 
-    # ---- 訓練集內再切 train / val ----
+    # ---- 訓練集內再切 train / val（按「模擬」切，避免同場相鄰幀洩漏到 val） ----
     trainval = SWEDataset(train_raw, factor=args.factor, mean=mean, std=std, downsample=args.downsample, noise_std=args.noise_std, seed=args.seed)
-    n_train = int((1 - args.val_frac) * len(trainval))
-    n_val = len(trainval) - n_train
-    gen = torch.Generator().manual_seed(args.seed)
-    train_set, val_set = random_split(trainval, [n_train, n_val], generator=gen)
+    n_sims_train = int(getattr(args, "n_train_groups", 0) or 0)
+    T_per_sim = (len(trainval) // n_sims_train) if n_sims_train > 0 else 0
+    if T_per_sim > 1:
+        n_val_sims = max(1, int(round(args.val_frac * n_sims_train)))
+        sim_perm = np.random.default_rng(args.seed).permutation(n_sims_train)
+        val_sims = set(int(s) for s in sim_perm[:n_val_sims])
+        val_idx = [i for i in range(len(trainval)) if (i // T_per_sim) in val_sims]
+        train_idx = [i for i in range(len(trainval)) if (i // T_per_sim) not in val_sims]
+        train_set = Subset(trainval, train_idx)
+        val_set = Subset(trainval, val_idx)
+        n_val = len(val_idx)
+    else:
+        print(f"[WARN] 每場只有 {T_per_sim} 幀 → frame-level split（此時與 sim-level 等價，無洩漏）")
+        n_train = int((1 - args.val_frac) * len(trainval))
+        n_val = len(trainval) - n_train
+        gen = torch.Generator().manual_seed(args.seed)
+        train_set, val_set = random_split(trainval, [n_train, n_val], generator=gen)
 
     test_set = SWEDataset(test_raw, factor=args.factor, mean=mean, std=std, downsample=args.downsample, noise_std=args.noise_std, seed=args.seed + 1)
 
@@ -945,7 +1125,8 @@ def main():
                         "noise_std": args.noise_std, "factor": args.factor,
                         "downsample": args.downsample, "loss": args.loss, "grad_loss_weight": args.grad_loss_weight,
                         "split_mode": args.split_mode, "test_group_ids": test_group_ids,
-                        "n_unique": n_unique, "n_train_groups": n_train_groups, "n_channels": C,
+                        "train_group_ids": sorted(int(g) for g in train_groups),
+                        "n_unique": n_unique, "n_train_groups": n_train_groups, "n_test_groups": n_test_groups, "n_channels": C,
                     },
                 },
                 best_path,
