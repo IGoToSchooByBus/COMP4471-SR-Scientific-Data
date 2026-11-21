@@ -26,6 +26,9 @@ def check_training_source(path):
     tree = ast.parse(source)
     main = next(node for node in tree.body
                 if isinstance(node, ast.FunctionDef) and node.name == "main")
+    precise_assignment = ast.parse("mean, std = compute_normalization_stats(train_raw)").body[0]
+    if any(ast.dump(node) == ast.dump(precise_assignment) for node in main.body):
+        return source
     for name, expected in {
         "mean": "train_raw.reshape(-1, C).mean(axis=0).astype(np.float64)",
         "std": "train_raw.reshape(-1, C).std(axis=0).astype(np.float64)",
@@ -167,13 +170,16 @@ def self_test(source):
     tree = ast.parse(source)
     functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
     names = ("load_swe_representative", "unique_group_ids", "load_dam_radius", "load_sim_params", "load_swe_timeseries")
+    if "compute_normalization_stats" in functions:
+        names += ("compute_normalization_stats",)
     reference = {"np": np, "h5py": h5py, "re": __import__("re")}
     exec(compile(ast.Module(body=[functions[name] for name in names], type_ignores=[]), "training_reference", "exec"), reference)
     main_body = functions["main"].body
     start = next(i for i, node in enumerate(main_body) if isinstance(node, ast.Assign)
                  and any(isinstance(t, ast.Tuple) and any(isinstance(e, ast.Name) and e.id == "rep_fields" for e in t.elts) for t in node.targets))
     end = next(i for i, node in enumerate(main_body) if isinstance(node, ast.Assign)
-               and any(isinstance(t, ast.Name) and t.id == "std" for t in node.targets))
+               and any(isinstance(t, ast.Name) and t.id == "std"
+                       for target in node.targets for t in ast.walk(target)))
     pre_training = ast.Module(body=main_body[start:end + 1], type_ignores=[])
     rng = np.random.default_rng(42)
     with tempfile.TemporaryDirectory(prefix="comp4471-stats-test-") as temp:
@@ -202,8 +208,13 @@ def self_test(source):
             np.testing.assert_array_equal(selection["train_group_ids_ordered"], expected["train_groups"])
             np.testing.assert_array_equal(selection["test_group_ids_ordered"], expected["test_groups"])
             np.testing.assert_array_equal(streamed, expected["train_raw"].reshape(-1, 3))
-            np.testing.assert_array_equal(got[0], expected["mean"])
-            np.testing.assert_array_equal(got[1], expected["std"])
+            precise = "compute_normalization_stats" in functions
+            if precise:
+                np.testing.assert_allclose(got[2], expected["mean"], rtol=1e-12, atol=1e-13)
+                np.testing.assert_allclose(got[3], expected["std"], rtol=1e-12, atol=1e-13)
+            else:
+                np.testing.assert_array_equal(got[0], expected["mean"])
+                np.testing.assert_array_equal(got[1], expected["std"])
     print("PASS: float32 replay bit-identical; float64 reference agrees.")
     print("PASS: actual training split, deduplication, representative order, frame selection and raw pixels match (3 cases).")
 
