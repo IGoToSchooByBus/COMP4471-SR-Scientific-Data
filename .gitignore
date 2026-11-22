@@ -1,5 +1,5 @@
 # 大資料（改用 Google Drive 分享，不上 GitHub）
-pdebench/data/*.h5
+/pdebench/data/
 
 # 訓練結果與 checkpoint（可重新產生）
 pdebench/outputs*/
@@ -22,3 +22,7 @@ __pycache__/
 # 系統
 .DS_Store
 Thumbs.db
+
+# Root-level downloaded datasets
+/*.h5
+/*.hdf5

@@ -160,6 +160,27 @@ def get_downsample_fn(name: str):
     raise ValueError(f"未知的 downsampling 方法：{name}（可選 block / pointwise）")
 
 
+def compute_normalization_stats(hr_data, chunk_rows=65536):
+    """Per-channel population statistics with bounded float64 working memory."""
+    channels = hr_data.shape[-1]
+    flat = hr_data.reshape(-1, channels)
+    count = flat.shape[0]
+    total = np.zeros(channels, dtype=np.float64)
+    for start in range(0, count, chunk_rows):
+        total += flat[start:start + chunk_rows].sum(axis=0, dtype=np.float64)
+    mean = total / count
+
+    # Center before squaring: E[x*x] - E[x]**2 loses precision for small variance.
+    squared_deviations = np.zeros(channels, dtype=np.float64)
+    for start in range(0, count, chunk_rows):
+        block = np.array(flat[start:start + chunk_rows], dtype=np.float64, copy=True)
+        block -= mean
+        np.square(block, out=block)
+        squared_deviations += block.sum(axis=0, dtype=np.float64)
+    std = np.sqrt(squared_deviations / count)
+    return mean, std
+
+
 class SWEDataset(Dataset):
     """回傳歸一化後的 (LR, HR) pair；歸一化統計量用訓練集計算。"""
 
@@ -997,8 +1018,7 @@ def main():
     args.n_test_groups = int(n_test_groups)
 
     # 逐通道歸一化（C=1 為單通道，C=3 為 h/u/v）
-    mean = train_raw.reshape(-1, C).mean(axis=0).astype(np.float64)          # [C]
-    std = train_raw.reshape(-1, C).std(axis=0).astype(np.float64)            # [C]
+    mean, std = compute_normalization_stats(train_raw)
     data_range = train_raw.reshape(-1, C).max(axis=0) - train_raw.reshape(-1, C).min(axis=0)  # [C]
     if args.data_range is not None:
         data_range = np.full(C, args.data_range, dtype=np.float64)   # 固定 R，跨實驗可比
