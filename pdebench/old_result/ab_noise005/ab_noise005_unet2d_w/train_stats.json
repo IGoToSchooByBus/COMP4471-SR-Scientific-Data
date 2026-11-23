@@ -1,0 +1,35 @@
+{
+  "mean": [
+    0.11690626293420792,
+    6.262268481549427e-12,
+    -5.376681088201107e-13
+  ],
+  "std": [
+    0.3583012521266937,
+    0.07521861046552658,
+    0.07439134269952774
+  ],
+  "data_range": [
+    2.3510491847991943,
+    1.4583548307418823,
+    1.4714692831039429
+  ],
+  "train_min": -0.7357346415519714,
+  "train_max": 2.498457670211792,
+  "test_samples": 2100,
+  "val_size": 1890,
+  "t_start": 0,
+  "t_end": 20,
+  "t_step": 1,
+  "noise_std": 0.05,
+  "factor": 4,
+  "seed": 0,
+  "downsample": "pointwise",
+  "loss": "l1",
+  "grad_loss_weight": 0.5,
+  "split_mode": "random",
+  "n_unique": 1000,
+  "n_train_groups": 900,
+  "n_test_groups": 100,
+  "n_channels": 3
+}

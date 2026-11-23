@@ -35,10 +35,11 @@ def load_test_sims(path, r_min=0.0):
     return sims
 
 
-def invert_params(lr_h_t0, domain_size=1.0):
+def invert_params(lr_h_t0, domain_size=5.0):
     """從 t=0 的 LR 水位場反演 (dam_radius, inner_height)。
     t=0 的場是「圓盤」：盤內 = inner_height（均勻），盤外 = 1.0（背景）。
-    用面積估計半徑（對邊界量化較穩健）、用最大值估計盤內高度。"""
+    用面積估計半徑（對邊界量化較穩健）、用最大值估計盤內高度。
+    domain_size = 5.0：sim_radial_dam_break 的 domain 是 [-2.5, 2.5]²（5 單位寬）。"""
     max_h = float(lr_h_t0.max())
     min_h = float(lr_h_t0.min())
     thr = (max_h + min_h) / 2.0
@@ -86,14 +87,16 @@ def main():
         # forward model
         pred = forward_simulate(r_est, h_est)   # [21,128,128,3]
 
-        # 評估（逐幀、分通道、用各自 data_range；常數場跳過）
+        # 評估（逐幀、分通道、用各自 data_range；常數場與完美吻合的幀跳過）
         psnr_sim = []
         for t in range(data.shape[0]):
             for c in range(3):
                 dr = float(data[t, :, :, c].max() - data[t, :, :, c].min())
                 if dr < 1e-12:
-                    continue
+                    continue   # 常數場（t=0 的 u/v=0）→ PSNR 無定義，跳過
                 mse = float(((data[t, :, :, c] - pred[t, :, :, c]) ** 2).mean())
+                if mse < 1e-18:
+                    continue   # 完美吻合（初始條件在網格上量化一致）→ PSNR 無限，跳過
                 mse_all.append(mse)
                 psnr = 10.0 * np.log10(dr ** 2 / mse)
                 psnr_sim.append(psnr)
@@ -102,7 +105,7 @@ def main():
         results.append({
             "key": key, "r_true": r_true, "h_true": h_true,
             "r_est": r_est, "h_est": h_est, "r_err": err_r,
-            "PSNR_sim_mean": float(np.mean(psnr_sim)),
+            "PSNR_sim_mean": float(np.mean(psnr_sim)) if psnr_sim else float("nan"),
         })
 
     summary = {

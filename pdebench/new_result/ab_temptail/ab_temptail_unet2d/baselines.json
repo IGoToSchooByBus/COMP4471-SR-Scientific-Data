@@ -1,0 +1,9 @@
+{
+  "baselines": null,
+  "group_summary": {
+    "n_test_groups": 1000,
+    "n_frames": 16000,
+    "PSNR_mean": 45.89969816575886,
+    "PSNR_std": 3.2008103929784792
+  }
+}

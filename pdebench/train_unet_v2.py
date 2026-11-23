@@ -28,9 +28,18 @@ PDEBench 2D Shallow Water: 超解析度 U-Net（方向 A + B + D）
   python train_unet_v2.py --downsample pointwise --factor 4 --loss l1 --grad_loss_weight 0.5 --split_mode extrapolate --out_dir outputs_extrap
   # 只評估（不訓練，直接讀 out_dir/model_best.pt）
   python train_unet_v2.py --eval_only --out_dir outputs_b
+
+效能（預設已開）：
+  --amp              CUDA 混合精度（tensor cores）；關閉用 --no-amp
+  --num_workers      DataLoader 子程序數（Windows 預設 0、Linux/Colab 預設 2）
+  --deterministic    關閉 cudnn.benchmark（預設關 = 快；開 = 逐位元可復現）
+  --ckpt_lean        checkpoint 不存 optimizer/scheduler（檔案小 ~3 倍、寫 Drive 快）
+  多模型共用 baseline 時：訓練加 --skip_baselines，最後用 run_eval.py 只算一次。
 """
 import argparse
+import contextlib
 import csv
+import gc
 import json
 import os
 import re
@@ -58,13 +67,36 @@ from tqdm import tqdm
 # --------------------------------------------------------------------------- #
 # 1. 可復現性
 # --------------------------------------------------------------------------- #
-def set_seed(seed: int):
+def set_seed(seed: int, deterministic: bool = False):
+    """統一 seed。deterministic=False（預設，快）時開啟 cudnn.benchmark，讓 cuDNN 選
+    最快卷積 kernel，訓練通常快 1.2–2 倍；數值差異 ~1e-7，不影響 PSNR 級結果。
+    需要逐位元可復現時傳 deterministic=True（cudnn.deterministic 強制慢演算法）。"""
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+
+def amp_autocast(enabled: bool):
+    """回傳 AMP autocast context（torch 1.13 / 2.x 相容）；disabled 時是 nullcontext。"""
+    if not enabled:
+        return contextlib.nullcontext()
+    try:
+        return torch.amp.autocast("cuda", enabled=True)   # torch >= 2.0
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.autocast(enabled=True)      # torch 1.x
+
+
+def make_grad_scaler(enabled: bool):
+    """AMP GradScaler（torch 1.13 / 2.x 相容）；disabled 回傳 None。"""
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -82,9 +114,9 @@ def load_swe_representative(path: str, t_index: int = 0):
 
 
 def load_swe_timeseries(path: str, sim_indices, t_start: int = 0, t_end: int = 100, t_step: int = 1):
-    """只載入「指定模擬」的完整時間序列（省記憶體），回傳 [len(sim_indices), T_sel, H, W]。
+    """只載入「指定模擬」的完整時間序列（省記憶體），回傳 [len(sim_indices), T_sel, H, W, C]。
 
-    方向 D：1000 場都唯一（2 參數 dam_radius × inner_height）；每場 21 幀。
+    新資料：1000 場都唯一（2 參數 dam_radius × inner_height）；每場 21 幀。
     """
     t_idx = list(range(t_start, t_end + 1, t_step))
     with h5py.File(path, "r") as f:
@@ -96,8 +128,9 @@ def load_swe_timeseries(path: str, sim_indices, t_start: int = 0, t_end: int = 1
 def unique_group_ids(hr_all):
     """把「相同模擬」的樣本歸到同一組（用整張場的 bytes 當 key）。
 
-    返回 (每筆樣本的 group id, 唯一場數)。radial dam break 的 dam_radius 在 128×128
-    網格上被離散化，1000 筆其實只有 ~81 種不同的場；用場本身分組可自動偵測重複。
+    返回 (每筆樣本的 group id, 唯一場數)。新資料 1000 場全部唯一（2 參數不同），
+    舊資料（單參數）在 128×128 網格上被離散化、1000 筆只有 ~81 種場；用場本身
+    分組可自動偵測重複，兩種資料都正確。
     """
     seen = {}
     gids = np.empty(len(hr_all), dtype=np.int64)
@@ -485,6 +518,9 @@ def compute_local_linear_extrapolation_baseline(train_hr, train_params, test_hr,
 
     # 外推用的 band：所有 test sim 共用同一個 sel → fit 只算 T 次（不重複 N_test 次）
     band_sel = np.where(train_params[:, 0] >= r_max - 0.05)[0]
+    if len(band_sel) < 3:
+        # 閾值設定極端時 band 可能過窄/為空 → 退回全訓練集，避免退化擬合（全零解）
+        band_sel = np.arange(len(train_params))
     X_band = np.column_stack([np.ones(len(band_sel)), tr_n[band_sel, 0], tr_n[band_sel, 1]])
     XtX_inv_Xt_band = np.linalg.solve(X_band.T @ X_band + 1e-2 * np.eye(3), X_band.T)
     W_band = [XtX_inv_Xt_band @ train_hr[band_sel, t].reshape(len(band_sel), D).astype(np.float64)
@@ -648,15 +684,26 @@ def evaluate_and_save(
     }
 
     # 同測試集上的 bicubic baseline（用「模型看到的同一批含雜訊 LR」，保證公平）
+    # 批次化 interpolate（每批 256 張）→ kernel launch 從 n_test 次降到 n_test/256 次，eval 快數倍
     noisy_lr_all = test_loader.dataset.lr   # [n_test, H_lr, W_lr, C]，已含雜訊
     bic_mse, bic_psnr, bic_ssim, bic_mae, bic_maxerr = [], [], [], [], []
     bic_psnr_per_ch_list = []
-    for hr, lr in zip(test_raw, noisy_lr_all):
-        bic = bicubic_upsample_raw(lr, hr.shape[:2])   # [H, W, C]
-        m = compute_metrics_multichannel(hr.transpose(2, 0, 1), bic.transpose(2, 0, 1), data_range)
-        bic_mse.append(m["MSE"]); bic_psnr.append(m["PSNR"]); bic_ssim.append(m["SSIM"])
-        bic_mae.append(m["MAE"]); bic_maxerr.append(m["MaxError"])
-        bic_psnr_per_ch_list.append(m["PSNR_per_channel"])
+    target_hw = tuple(test_raw[0].shape[:2])
+    bic_chunk = 256
+    for start in range(0, len(noisy_lr_all), bic_chunk):
+        chunk = np.ascontiguousarray(noisy_lr_all[start:start + bic_chunk], dtype=np.float32)
+        with torch.no_grad():
+            up = F.interpolate(
+                torch.from_numpy(chunk).permute(0, 3, 1, 2),
+                size=target_hw, mode="bicubic", align_corners=False,
+            ).permute(0, 2, 3, 1).numpy()   # [c, H, W, C]
+        for j in range(up.shape[0]):
+            bic = up[j]   # [H, W, C]
+            hr = test_raw[start + j]
+            m = compute_metrics_multichannel(hr.transpose(2, 0, 1), bic.transpose(2, 0, 1), data_range)
+            bic_mse.append(m["MSE"]); bic_psnr.append(m["PSNR"]); bic_ssim.append(m["SSIM"])
+            bic_mae.append(m["MAE"]); bic_maxerr.append(m["MaxError"])
+            bic_psnr_per_ch_list.append(m["PSNR_per_channel"])
     bicubic_summary = {
         "method": f"{args.downsample} down + bicubic (align_corners=False)",
         "downsample": args.downsample,
@@ -868,7 +915,14 @@ def run_eval_only(args, device):
         baselines.update(compute_lr_nn_baseline(
             train_full.lr, train_full.hr, test_set.lr, test_set.hr, data_range
         ))
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False)
+    del full      # baseline 已算完，釋放 4.1GB 時間序列
+    gc.collect()
+    test_loader = DataLoader(
+        test_set, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
 
     base = int(ckpt.get("args", {}).get("base", 32))
     model_name = ckpt.get("args", {}).get("model", "miniunet")
@@ -888,7 +942,7 @@ def run_eval_only(args, device):
 # --------------------------------------------------------------------------- #
 def main():
     p = argparse.ArgumentParser(description="工程化 U-Net 超解析度訓練（方向 A + B）")
-    p.add_argument("--data_path", type=str, default="data/2D_rdb_NA_NA.h5")
+    p.add_argument("--data_path", type=str, default="data/2D_rdb_NA_NA_.h5")
     p.add_argument("--t_start", type=int, default=0, help="使用的起始時間步（方向 D：多時間步）")
     p.add_argument("--t_end", type=int, default=20, help="使用的結束時間步（含）。21 幀資料用 20；101 幀資料用 100")
     p.add_argument("--t_step", type=int, default=1, help="時間步間隔（>1 可降低相鄰幀相關性與成本）")
@@ -924,9 +978,17 @@ def main():
     p.add_argument("--eval_only", action="store_true", help="不訓練，只讀 checkpoint 做評估")
     p.add_argument("--skip_baselines", action="store_true", help="不計算 baselines（多模型共用同一組 baseline 時，只對第一個模型算）")
     p.add_argument("--ckpt", type=str, default=None, help="評估用的 checkpoint（預設 out_dir/model_best.pt）")
+    p.add_argument("--ckpt_lean", action="store_true",
+                   help="checkpoint 只存權重+訓練統計，不存 optimizer/scheduler 狀態（檔案小 ~3 倍、存檔快；resume 時優化器重建）")
+    p.add_argument("--num_workers", type=int, default=(0 if os.name == "nt" else 2),
+                   help="DataLoader 子程序數。Windows 預設 0（spawn 會複製整個資料集，記憶體貴）；Linux/Colab 預設 2（fork 共享記憶體）")
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True,
+                   help="混合精度訓練（CUDA 才生效，用上 tensor cores；--no-amp 關閉回到純 FP32）")
+    p.add_argument("--deterministic", action="store_true",
+                   help="關閉 cudnn.benchmark、強制 deterministic 演算法（慢，但逐位元可復現；預設關 = 快）")
     args = p.parse_args()
 
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -1045,6 +1107,9 @@ def main():
         ))
     else:
         baselines = None
+    # full（1000 場 × 21 幀 ≈ 4.1GB）在此之後不再使用；釋放以降低 SWEDataset/DataLoader 的峰值記憶體
+    del full
+    gc.collect()
     print(f"downsample={args.downsample}, loss={args.loss}, grad_loss_weight={args.grad_loss_weight}, channels={C}")
 
     # ---- 訓練集內再切 train / val（按「模擬」切，避免同場相鄰幀洩漏到 val） ----
@@ -1075,9 +1140,15 @@ def main():
             trainval.lr, trainval.hr, test_set.lr, test_set.hr, data_range
         ))
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False)
+    # ---- DataLoader（num_workers + pin_memory：GPU 不再等 CPU 餵資料） ----
+    dl_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+    )
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **dl_kwargs)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, **dl_kwargs)
+    test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, **dl_kwargs)
 
     # ---- 模型 / 優化器 / 調度器 / 損失 ----
     model = make_model(args.model, in_ch=C, out_ch=C, base=args.base).to(device)
@@ -1095,24 +1166,39 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["val_loss"]
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        else:
+            # --ckpt_lean 存的 checkpoint 沒有 optimizer 狀態：優化器從頭開始（lr 重設）
+            print(f"[WARN] checkpoint 無 optimizer 狀態（--ckpt_lean）→ 優化器/lr 重新開始")
         print(f"Resumed from {args.resume}, epoch={start_epoch}, best_val_loss={best_val_loss:.6f}")
 
     # ---- 訓練 + 早停 + 存最佳 ----
+    use_amp = bool(args.amp) and device.type == "cuda"
+    scaler = make_grad_scaler(use_amp)
+    amp_ctx = amp_autocast(use_amp)
+    if use_amp:
+        print("AMP（混合精度）已啟用；用 --no-amp 可關閉")
     patience_counter = 0
     for epoch in range(start_epoch, args.epochs):
         model.train()
         train_loss = 0.0
         for lr_img, hr_img in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", leave=False):
-            lr_img, hr_img = lr_img.to(device), hr_img.to(device)
-            pred = upsample_and_predict(model, lr_img, hr_img.shape[-2:])
-            loss = compute_total_loss(pred, hr_img, criterion, args.grad_loss_weight)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            lr_img, hr_img = lr_img.to(device, non_blocking=True), hr_img.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with amp_ctx:
+                pred = upsample_and_predict(model, lr_img, hr_img.shape[-2:])
+                loss = compute_total_loss(pred, hr_img, criterion, args.grad_loss_weight)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             train_loss += loss.item() * lr_img.size(0)
         train_loss /= len(train_set)
 
@@ -1120,7 +1206,8 @@ def main():
         val_loss = 0.0
         with torch.no_grad():
             for lr_img, hr_img in val_loader:
-                lr_img, hr_img = lr_img.to(device), hr_img.to(device)
+                lr_img, hr_img = lr_img.to(device, non_blocking=True), hr_img.to(device, non_blocking=True)
+                # val 用 FP32：早停/ReduceLROnPlateau 的比較基準保持全精度、與舊 run 可比
                 pred = upsample_and_predict(model, lr_img, hr_img.shape[-2:])
                 val_loss += compute_total_loss(pred, hr_img, criterion, args.grad_loss_weight).item() * lr_img.size(0)
         val_loss /= len(val_set)
@@ -1131,26 +1218,27 @@ def main():
         if improved:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "val_loss": val_loss,
-                    "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-                    "train_stats": {
-                        "mean": mean, "std": std, "data_range": data_range,
-                        "t_start": args.t_start, "t_end": args.t_end, "t_step": args.t_step,
-                        "noise_std": args.noise_std, "factor": args.factor,
-                        "downsample": args.downsample, "loss": args.loss, "grad_loss_weight": args.grad_loss_weight,
-                        "split_mode": args.split_mode, "test_group_ids": test_group_ids,
-                        "train_group_ids": sorted(int(g) for g in train_groups),
-                        "n_unique": n_unique, "n_train_groups": n_train_groups, "n_test_groups": n_test_groups, "n_channels": C,
-                    },
+            ckpt_dict = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "val_loss": val_loss,
+                "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+                "train_stats": {
+                    "mean": mean, "std": std, "data_range": data_range,
+                    "t_start": args.t_start, "t_end": args.t_end, "t_step": args.t_step,
+                    "noise_std": args.noise_std, "factor": args.factor,
+                    "downsample": args.downsample, "loss": args.loss, "grad_loss_weight": args.grad_loss_weight,
+                    "split_mode": args.split_mode, "test_group_ids": test_group_ids,
+                    "train_group_ids": sorted(int(g) for g in train_groups),
+                    "n_unique": n_unique, "n_train_groups": n_train_groups, "n_test_groups": n_test_groups, "n_channels": C,
                 },
-                best_path,
-            )
+            }
+            if not args.ckpt_lean:
+                # 預設存完整狀態（支援精確 resume）；--ckpt_lean 跳過 optimizer/scheduler，
+                # checkpoint 縮小約 3 倍（unet2d_wide ~368MB → ~92MB），寫 Drive 快很多
+                ckpt_dict["optimizer_state_dict"] = optimizer.state_dict()
+                ckpt_dict["scheduler_state_dict"] = scheduler.state_dict()
+            torch.save(ckpt_dict, best_path)
         else:
             patience_counter += 1
 

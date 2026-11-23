@@ -85,6 +85,7 @@
 | `--seed` | 0 | 隨機種子（可復現） |
 | `--patience` | 15 | 早停：連續多少 epoch 無改善即停 |
 | `--lr_patience` | 5 | ReduceLROnPlateau 的 patience |
+| `--amp` / `--no-amp` | 開 | CUDA 混合精度（tensor cores，快 1.5–2 倍）；`--no-amp` 回到純 FP32 |
 
 ### 執行
 
@@ -93,7 +94,11 @@
 | `--out_dir` | `outputs_unet_v2` | 輸出目錄（結果 + checkpoint） |
 | `--resume` | None | 從 checkpoint 繼續訓練 |
 | `--eval_only` | False | 不訓練，只讀 checkpoint 做評估（補算 baseline） |
+| `--skip_baselines` | False | 訓練時不算 baseline（同實驗 4 個模型共用同一組 baseline，只對第一個算，最後用 `run_eval.py` 補一次） |
 | `--ckpt` | None | 評估用 checkpoint（預設 `out_dir/model_best.pt`） |
+| `--ckpt_lean` | False | checkpoint 不存 optimizer/scheduler 狀態（檔案小 ~3 倍、寫 Drive 快；resume 時優化器重建、lr 重設） |
+| `--num_workers` | Win 0 / 其他 2 | DataLoader 子程序數（Windows spawn 記憶體貴所以預設 0） |
+| `--deterministic` | 關 | 關閉 cudnn.benchmark、強制 deterministic（慢但逐位元可復現；預設關 = 快） |
 
 ### 常用命令
 
@@ -107,53 +112,57 @@ python train_unet_v2.py --data_path data/2D_rdb_NA_NA_.h5 --model miniunet \
 python train_unet_v2.py --eval_only --data_path data/2D_rdb_NA_NA_.h5 --out_dir outputs_miniunet
 ```
 
-## 最新結果摘要
+## 最新結果摘要（最終版，pointwise 對齊修正後）
 
-### 模型對照（隨機切分，1000 樣本、3 通道）
+### 模型對照（3 seeds，mean ± std）
 
-| 方法 | PSNR (dB) | SSIM |
+| 模型 | PSNR | pooled_PSNR |
 |---|---|---|
-| Bicubic | 37.13 | 0.950 |
-| SRCNN | 51.03 | 0.996 |
-| **MiniUNet** | **57.43** | 0.999 |
-| UNet2d | 57.33 | 0.999 |
-| UNet2d wide | 56.08 | 0.999 |
-| 1-NN（oracle） | 57.54 | 0.998 |
-| 線性內插（oracle） | **57.92** | 0.999 |
+| SRCNN | 52.00 ± 0.19 | 52.58 ± 0.08 |
+| MiniUNet | 58.29 ± 0.23 | 54.99 ± 0.20 |
+| UNet2d | 57.75 ± 0.37 | 55.37 ± 0.29 |
+| UNet2d wide | 58.95 ± 1.37 | 55.38 ± 1.06 |
 
-### 噪聲消融（PSNR, dB）
+三種 U-Net 統計上相當（誤差棒重疊）；SRCNN 明顯較弱（−6 dB）。pooled 比 per-sample 低 ~3 dB = t=0 幀灌水。
 
-| 方法 | σ=0 | σ=0.05 | σ=0.1 | σ=0.2 |
-|---|---|---|---|---|
-| Bicubic | 37.13 | 30.61 | 25.63 | 19.96 |
-| SRCNN | 51.03 | 40.36 | 36.01 | 32.16 |
-| MiniUNet | 57.43 | 45.34 | 40.91 | 35.56 |
-| UNet2d | 57.33 | 47.34 | 43.35 | **43.23** |
-| UNet2d wide | 56.08 | 46.80 | 43.52 | 38.71 |
-| LR 最近鄰 | **59.59** | **49.48** | **44.06** | 37.64 |
+### 參數外推（train r≤0.40 → test r≥0.60，最關鍵）
 
-### 參數外推（train r≤0.40 → test r≥0.60）
+| 方法 | MSE | pooled PSNR |
+|---|---|---|
+| 1-NN / inv_dist（查表） | 0.0086 | 30.7 |
+| 線性外推（global/local） | 0.013~0.014 | 28.5~28.9 |
+| LR 最近鄰 | 0.0072 | 31.5 |
+| **U-Net（MiniUNet）** | 9.48e-5 | **50.31** |
+| **Classical pipeline（參數反演 + Clawpack）** | **8.97e-5** | **≈50.5** |
 
-| 方法 | PSNR (dB) |
+**U-Net 贏查表 baseline 24 dB，但和物理古典 pipeline 打平**——深度學習在此資料的外推上沒有超越物理方法。
+
+### 時間外推（MiniUNet）
+
+| 方向 | PSNR |
 |---|---|
-| SRCNN | 45.20 |
-| MiniUNet | 49.46 |
-| UNet2d | 49.91 |
-| **UNet2d wide** | **50.87** |
-| 1-NN（oracle） | 26.15 |
-| 線性內插（oracle） | 26.15 |
+| head（早→晚） | 44.49 |
+| tail（晚→早） | 47.65 |
 
-### 時間外推
+早→晚更難（初始壩體結構獨特）。
 
-| 方法 | head（早→晚） | tail（晚→早） |
+### 噪聲消融（MiniUNet，σ=0.2 未跑）
+
+| σ=0 | σ=0.05 | σ=0.1 |
 |---|---|---|
-| SRCNN | 42.72 | 41.58 |
-| MiniUNet | 46.80 | 44.21 |
-| UNet2d | 47.44 | 44.64 |
-| **UNet2d wide** | **47.47** | **45.79** |
+| 58.29 ± 0.23 | 45.67 | 41.28 |
+
+### 混合（噪聲 0.1 + 參數外推 + 時間外推）
+
+MiniUNet：28.95 dB（最難，仍勝 bicubic 24.07）。
+
+### 失敗模式（t=0 破壞物理）
+
+U-Net 的 t=0 幀獨佔 **78% 的 MSE**（預測非零 u/v，違反初始靜止條件）；classical pipeline 的物理天生免疫——U-Net 最大的失敗模式，恰是物理方法零成本擁有的優勢。
 
 **核心結論**：
-1. **參數外推是正面證據**：U-Net（49~51 dB）遠勝參數 oracle（26 dB），證明 U-Net 學到「可轉移的空間映射」而非查表。
-2. **時間外推不對稱**：晚→早（44.21）比早→晚（46.80）更難。
-3. **噪聲有「交叉點」**：低噪聲（σ≤0.1）LR 最近鄰勝過 U-Net（非參數查表先天去噪）；高噪聲（σ=0.2）U-Net 反超 LR 最近鄰（43.23 vs 37.64）——U-Net 學到的去噪在高噪聲下終於勝過查表。
-4. **容量排序**：外推/噪聲時大模型較好；σ=0 乾淨時小模型較好（過擬合）。詳見 [04-progress.md](./docs/04-progress.md)。
+1. **模型容量**：三種 U-Net 相當（~58 dB）、SRCNN 弱、大模型變異大。
+2. **外推**：U-Net >> 查表 baseline（+24 dB），但 **≈ 物理 classical pipeline（打平 ~50.5 dB）**。
+3. **時間**：早→晚更難。
+4. **失敗模式**：t=0 佔 78% MSE，物理方法免疫。
+5. **根本洞察**：此平滑資料對深度學習過於簡單——物理古典方法與深度學習打平；深度學習的價值需在更高複雜度的場（湍流）才能彰顯。詳見 [04-progress.md](./docs/04-progress.md)。
