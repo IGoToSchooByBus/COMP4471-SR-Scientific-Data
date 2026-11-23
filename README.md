@@ -21,6 +21,8 @@
 | [Colab 訓練](./colab_training.md) | 付費 GPU 上一次跑完 4 個模型對照 |
 | [Colab 消融](./colab_ablation.md) | 噪聲 / 參數外推 / 時間外推 / 混合（4 實驗 × 4 模型） |
 資料: https://drive.google.com/file/d/1LUJn9pi8lpiMdJGrBJryhy4XN2XQEV47/view?usp=drive_link
+new_result:https://drive.google.com/drive/folders/1KcVyAClD5SrFzcqHn9PzWVUbzyErlWbu?usp=drive_link
+old_result:https://drive.google.com/drive/folders/18BqA8e2nXtrcBqJpqgHvQAtp-KRByWo9?usp=drive_link
 ## 關鍵檔案位置
 
 | 檔案 | 路徑 |
